@@ -53,7 +53,8 @@ from amqtt.session import (
 from amqtt.mqtt.constants import QOS_0, QOS_1, QOS_2
 from amqtt.plugins.manager import PluginManager
 from amqtt.errors import AMQTTException, MQTTException, NoDataException
-
+from influxDB.influx_db import set_influxDB_point
+import json
 
 EVENT_MQTT_PACKET_SENT = "mqtt_packet_sent"
 EVENT_MQTT_PACKET_RECEIVED = "mqtt_packet_received"
@@ -95,6 +96,11 @@ class ProtocolHandler:
         self._pubcomp_waiters = dict()
 
         self._write_lock = asyncio.Lock()
+        # todo self.topic, self.message has been added
+        self.topic = None
+        self.message = None
+        self.sender = None
+        self.receiver = None
 
     def _init_session(self, session: Session):
         assert session
@@ -189,7 +195,7 @@ class ProtocolHandler:
             )
         self.logger.debug("End messages delivery retries")
 
-    async def mqtt_publish(self, topic, data, qos, retain, ack_timeout=None):
+    async def mqtt_publish(self, topic, data, qos, retain, ack_timeout=None, sender=None, receiver=None):
         """
         Sends a MQTT publish message and manages messages flows.
         This methods doesn't return until the message has been acknowledged by receiver or timeout occur
@@ -211,14 +217,17 @@ class ProtocolHandler:
         else:
             packet_id = None
 
-        message = OutgoingApplicationMessage(packet_id, topic, qos, data, retain)
+        self.message = OutgoingApplicationMessage(packet_id, topic, qos, data, retain)
+        self.topic = topic
+        self.sender = sender['session']
+        self.receiver = receiver
         # Handle message flow
         if ack_timeout is not None and ack_timeout > 0:
-            await asyncio.wait_for(self._handle_message_flow(message), ack_timeout)
+            await asyncio.wait_for(self._handle_message_flow(self.message), ack_timeout)
         else:
-            await self._handle_message_flow(message)
+            await self._handle_message_flow(self.message)
 
-        return message
+        return self.message
 
     async def _handle_message_flow(self, app_message):
         """
@@ -410,6 +419,7 @@ class ProtocolHandler:
         if keepalive_timeout <= 0:
             keepalive_timeout = None
         while True:
+            self.client_id = self.session.client_id
             try:
                 self._reader_ready.set()
                 while running_tasks and running_tasks[0].done():
@@ -461,12 +471,31 @@ class ProtocolHandler:
                         elif packet.fixed_header.packet_type == PUBREL:
                             task = asyncio.ensure_future(self.handle_pubrel(packet))
                         elif packet.fixed_header.packet_type == PUBCOMP:
+                            # todo: add to db that the msg has been received by a particular client
+                            # todo: publish - pubcomp = time
+                            print(f"\nmeasurement=msg_data, \nclient_id={self.client_id}, \nctype=sub, \ntopic={self.topic}, \nmsg={self.message.data}, \nqos=2, \nreceiver_id={self.receiver.client_id},\nsender_id={self.sender.client_id}, \nreach_out=1")
+
+                            set_influxDB_point(measurement="msg_data", client_id=f"{self.client_id}",
+                                               ctype="sub",
+                                               topic=f"{self.topic}", msg=f"{json.loads(self.message.data.decode('utf-8'))['msg']}", qos=f"2", receiver_id=f"{self.receiver.client_id}", sender_id=self.sender.client_id , reach_out="1")
                             task = asyncio.ensure_future(self.handle_pubcomp(packet))
                         elif packet.fixed_header.packet_type == PINGREQ:
                             task = asyncio.ensure_future(self.handle_pingreq(packet))
                         elif packet.fixed_header.packet_type == PINGRESP:
                             task = asyncio.ensure_future(self.handle_pingresp(packet))
                         elif packet.fixed_header.packet_type == PUBLISH:
+                            # todo: add to db that a msg has been published
+                            # packet_id = packet.variable_header.packet_id
+                            # self.topic = packet.topic_name
+
+                            # qos = packet.qos
+                            # message = OutgoingApplicationMessage(packet_id, packet.topic_name, qos,
+                            #                                          packet.data, packet.retain_flag)
+
+                            print(f"\nmeasurement=msg_data, \nclient_id={self.client_id}, \nctype=pub, \ntopic={packet.topic_name}, \nmsg={packet.data}, \nsender_id={self.client_id}, \nqos={packet.qos}, \nreach_out=0")
+                            set_influxDB_point(measurement="msg_data", client_id=f"{self.client_id}",
+                                               ctype="pub",
+                                               topic=f"{packet.topic_name}", msg=f"{json.loads(packet.data.decode('utf-8'))['msg']}", sender_id={self.client_id}, qos=f"{packet.qos}", reach_out="0")
                             task = asyncio.ensure_future(self.handle_publish(packet))
                         elif packet.fixed_header.packet_type == DISCONNECT:
                             task = asyncio.ensure_future(self.handle_disconnect(packet))

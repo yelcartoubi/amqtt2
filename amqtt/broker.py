@@ -25,7 +25,22 @@ from amqtt.adapters import (
     WebSocketsReader,
     WebSocketsWriter,
 )
+from influxDB.influx_db import set_influxDB_point, delete_influxDB_point_client_id, get_influxDB_point
 from .plugins.manager import PluginManager, BaseContext
+
+bucket = "BROKER2"
+counters = {
+    'sub_counter': 0
+}
+def increment_session_value(subscribe):
+    global counters
+    if 'sub_counter' not in counters:
+        counters['sub_counter'] = 0
+    if subscribe == 1:
+        counters['sub_counter'] += 1
+    elif subscribe == 0:
+        counters['sub_counter'] -= 1
+    return counters['sub_counter']
 
 
 _defaults = {
@@ -396,7 +411,7 @@ class Broker:
         server = self._servers.get(listener_name, None)
         if not server:
             raise BrokerException("Invalid listener name '%s'" % listener_name)
-        await server.acquire_connection()
+        conn_count = await server.acquire_connection()
 
         remote_address, remote_port = writer.get_peer_info()
         self.logger.info(
@@ -408,6 +423,54 @@ class Broker:
         try:
             handler, client_session = await BrokerProtocolHandler.init_from_connect(
                 reader, writer, self.plugins_manager
+            )
+
+
+            # todo ban a client
+            client_id = client_session.client_id
+
+            client_data = get_influxDB_point(
+                measurement="banned",
+                query=f'''
+                            from(bucket: "{bucket}")
+                            |> range(start: -100000h)
+                            |> filter(fn: (r) => r["_measurement"] == "banned")
+                            
+                        '''
+            )
+            # |> filter(fn: (r) => r["client_id"] == "{client_id}")
+            # Check if the client is banned
+            print("//////////////////////////////////////////////////////////////")
+            print(client_data)
+            # for i in client_data:
+            #     if client_data: # and client_data[0]['ban'] == 'ban':
+            #         self.logger.info("Client %s is banned and cannot connect" % client_id)
+            #         await writer.close()
+            #         server.release_connection()
+            #         return
+            #     print(i['ban'])
+            print("//////////////////////////////////////////////////////////////")
+
+
+            # todo Extract username and password
+            client_id = client_session.client_id
+            clean_session = client_session.clean_session
+            will_flag = client_session.will_flag
+            will_retain = client_session.will_retain
+            will_qos = client_session.will_qos
+            will_topic = client_session.will_topic
+            will_message = client_session.will_message
+            username = client_session.username
+            password = client_session.password
+
+
+            delete_influxDB_point_client_id(measurement="authen", client_id=f"{client_id}")
+
+            set_influxDB_point(measurement="authen", client_id=f"{client_id}", clean_session=f"{clean_session}", qos=f"{will_qos}", topic=f"{will_topic}", msg=f"{will_message}", password=f"{password}", user_name=f"{username}", status="disabled", ban="Unban")
+
+            self.logger.info(
+                "Client %s connected with username: %s, password: %s"
+                % (client_session.client_id, username, password)
             )
         except AMQTTException as exc:
             self.logger.warning(
@@ -457,6 +520,7 @@ class Broker:
             client_session.keep_alive += self.config["timeout-disconnect-delay"]
         self.logger.debug("Keep-alive timeout=%d" % client_session.keep_alive)
 
+        # TODO AUTHENTICATE
         authenticated = await self.authenticate(
             client_session, self.listeners_config[listener_name]
         )
@@ -490,7 +554,10 @@ class Broker:
 
         handler.attach(client_session, reader, writer)
         self._sessions[client_session.client_id] = (client_session, handler)
-
+        # todo add to influx db connected client
+        set_influxDB_point(measurement="clients_data_sp", client_id=f"{client_session.client_id}", ctype="sub/pub",
+                           connect=f"{1}", remain=f"{conn_count}")
+        # get_influxDB_point("clients_data_sp")
         await handler.mqtt_connack_authorize(authenticated)
 
         await self.plugins_manager.fire_event(
@@ -568,6 +635,7 @@ class Broker:
                         "%s handling unsubscription" % client_session.client_id
                     )
                     unsubscription = unsubscribe_waiter.result()
+                    dis_topic = ""
                     for topic in unsubscription["topics"]:
                         self._del_subscription(topic, client_session)
                         await self.plugins_manager.fire_event(
@@ -575,9 +643,28 @@ class Broker:
                             client_id=client_session.client_id,
                             topic=topic,
                         )
+                        dis_topic = topic
                     await handler.mqtt_acknowledge_unsubscription(
                         unsubscription["packet_id"]
                     )
+                    # todo unsubscribe from topic
+                    print("**********************-----------***********************")
+                    print(f"unsubscribe from topic: \n\t{dis_topic}, client id: \n\t{client_session.client_id}")
+                    print("**********************-----------***********************")
+
+                    subs_num_d = increment_session_value(subscribe=0)
+                    # set_influxDB_point(measurement="topics_data", client_id=f"{client_session.client_id}",
+                     #                  ctype="pub",
+                      #                 topic=f"{dis_topic}", subscribe=f"{0}", subs_num=f"{subs_num_d}")
+
+                    set_influxDB_point(measurement="topics_data", topic=f"{dis_topic}",
+                                       client_id=f"{client_session.client_id}", qos=f"no QoS (unsubscribed)",
+                                       subs_num=f"{subs_num_d}")
+
+                    set_influxDB_point(measurement="sub_data", client_id=f"{client_session.client_id}",
+                                       ctype="pub",
+                                       topic=f"{dis_topic}", subscribe=f"{0}", )
+
                     unsubscribe_waiter = asyncio.Task(
                         handler.get_next_pending_unsubscription()
                     )
@@ -587,14 +674,30 @@ class Broker:
                     )
                     subscriptions = subscribe_waiter.result()
                     return_codes = []
+                    subscription_topic = ""
                     for subscription in subscriptions["topics"]:
                         result = await self.add_subscription(
                             subscription, client_session
                         )
                         return_codes.append(result)
+                        subscription_topic = subscription
                     await handler.mqtt_acknowledge_subscription(
                         subscriptions["packet_id"], return_codes
                     )
+                    # todo new subscription to topic
+                    print("*********************************************")
+                    print(f"new subscription to topic: \n\t{subscription_topic[0]}, \n\t qos : {subscription_topic[1]}, \n\t{client_session}")
+                    print("*********************************************")
+
+                    subs_num = increment_session_value(subscribe=1)
+                    set_influxDB_point(measurement="topics_data", topic=f"{subscription_topic[0]}",
+                                    client_id=f"{client_session.client_id}", qos=f"{subscription_topic[1]}",
+                                        subs_num=f"{subs_num}")
+
+                    set_influxDB_point(measurement="sub_data", client_id=f"{client_session.client_id}",
+                                        ctype="pub",
+                                        topic=f"{subscription_topic[0]}", subscribe=f"{1}",)
+
                     for index, subscription in enumerate(subscriptions["topics"]):
                         if return_codes[index] != 0x80:
                             await self.plugins_manager.fire_event(
@@ -665,7 +768,10 @@ class Broker:
         wait_deliver.cancel()
 
         self.logger.debug("%s Client disconnected" % client_session.client_id)
-        server.release_connection()
+        conn_count_dis = server.release_connection()
+        # todo add to influx db disconnected client
+        set_influxDB_point(measurement="clients_data_sp", client_id=f"{client_session.client_id}", ctype="sub/pub",
+                           connect=f"{0}", remain=f"{conn_count_dis}")
 
     def _init_handler(self, session, reader, writer):
         """
@@ -943,6 +1049,10 @@ class Broker:
                 # due to the session not being connected
                 if target_session.transitions.state != "connected":
                     await self._retain_broadcast_message(broadcast, qos, target_session)
+                    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+                    print(f"Retain all messages which cannot be broadcasted due to the session not being connected: \n\tsender: {broadcast['session'].client_id},\n\tsender state: connected, \n\tqos: {qos}, \n\treceiver: {target_session}, \n\treceiver state: disconnected,")
+                    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+                    set_influxDB_point(measurement="retained_msg" ,sender_id=broadcast['session'].client_id, sender_state="connected",qos={qos}, receiver_id={target_session.client_id}, receiver_state="disconnected")
                     continue
 
                 if self.logger.isEnabledFor(logging.DEBUG):
@@ -962,6 +1072,8 @@ class Broker:
                         broadcast["data"],
                         qos,
                         retain=False,
+                        sender=broadcast,
+                        receiver=target_session
                     ),
                 )
                 running_tasks.append(task)

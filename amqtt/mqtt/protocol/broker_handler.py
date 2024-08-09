@@ -24,7 +24,9 @@ from amqtt.plugins.manager import PluginManager
 from amqtt.adapters import ReaderAdapter, WriterAdapter
 from amqtt.errors import MQTTException
 from .handler import EVENT_MQTT_PACKET_RECEIVED, EVENT_MQTT_PACKET_SENT
+from influxDB.influx_db import set_influxDB_point, delete_influxDB_point_client_id, get_influxDB_point
 
+bucket = "BROKER2"
 
 class BrokerProtocolHandler(ProtocolHandler):
     def __init__(
@@ -114,18 +116,105 @@ class BrokerProtocolHandler(ProtocolHandler):
             connack = ConnackPacket.build(self.session.parent, NOT_AUTHORIZED)
         await self._send_packet(connack)
 
+    # @classmethod
+    # async def init_from_connect(
+    #     cls, reader: ReaderAdapter, writer: WriterAdapter, plugins_manager, loop=None
+    # ):
+    #     """
+    #
+    #     :param reader:
+    #     :param writer:
+    #     :param plugins_manager:
+    #     :param loop:
+    #     :return:
+    #     """
+    #     remote_address, remote_port = writer.get_peer_info()
+    #     connect = await ConnectPacket.from_stream(reader)
+    #     await plugins_manager.fire_event(EVENT_MQTT_PACKET_RECEIVED, packet=connect)
+    #     # this shouldn't be required anymore since broker generates for each client a random client_id if not provided
+    #     # [MQTT-3.1.3-6]
+    #     if connect.payload.client_id is None:
+    #         raise MQTTException("[[MQTT-3.1.3-3]] : Client identifier must be present")
+    #
+    #     if connect.variable_header.will_flag:
+    #         if (
+    #             connect.payload.will_topic is None
+    #             or connect.payload.will_message is None
+    #         ):
+    #             raise MQTTException(
+    #                 "will flag set, but will topic/message not present in payload"
+    #             )
+    #
+    #     if connect.variable_header.reserved_flag:
+    #         raise MQTTException("[MQTT-3.1.2-3] CONNECT reserved flag must be set to 0")
+    #     if connect.proto_name != "MQTT":
+    #         raise MQTTException(
+    #             '[MQTT-3.1.2-1] Incorrect protocol name: "%s"' % connect.proto_name
+    #         )
+    #
+    #     connack = None
+    #     error_msg = None
+    #     if connect.proto_level != 4:
+    #         # only MQTT 3.1.1 supported
+    #         error_msg = "Invalid protocol from %s: %d" % (
+    #             format_client_message(address=remote_address, port=remote_port),
+    #             connect.proto_level,
+    #         )
+    #         connack = ConnackPacket.build(
+    #             0, UNACCEPTABLE_PROTOCOL_VERSION
+    #         )  # [MQTT-3.2.2-4] session_parent=0
+    #     elif not connect.username_flag and connect.password_flag:
+    #         connack = ConnackPacket.build(0, BAD_USERNAME_PASSWORD)  # [MQTT-3.1.2-22]
+    #     elif connect.username_flag and connect.username is None:
+    #         error_msg = "Invalid username from %s" % (
+    #             format_client_message(address=remote_address, port=remote_port)
+    #         )
+    #         connack = ConnackPacket.build(
+    #             0, BAD_USERNAME_PASSWORD
+    #         )  # [MQTT-3.2.2-4] session_parent=0
+    #     elif connect.password_flag and connect.password is None:
+    #         error_msg = "Invalid password %s" % (
+    #             format_client_message(address=remote_address, port=remote_port)
+    #         )
+    #         connack = ConnackPacket.build(
+    #             0, BAD_USERNAME_PASSWORD
+    #         )  # [MQTT-3.2.2-4] session_parent=0
+    #     elif connect.clean_session_flag is False and (
+    #         connect.payload.client_id_is_random
+    #     ):
+    #         error_msg = (
+    #             "[MQTT-3.1.3-8] [MQTT-3.1.3-9] %s: No client Id provided (cleansession=0)"
+    #             % (format_client_message(address=remote_address, port=remote_port))
+    #         )
+    #         connack = ConnackPacket.build(0, IDENTIFIER_REJECTED)
+    #     if connack is not None:
+    #         await plugins_manager.fire_event(EVENT_MQTT_PACKET_SENT, packet=connack)
+    #         await connack.to_stream(writer)
+    #         await writer.close()
+    #         raise MQTTException(error_msg)
+    #
+    #     incoming_session = Session()
+    #     incoming_session.client_id = connect.client_id
+    #     incoming_session.clean_session = connect.clean_session_flag
+    #     incoming_session.will_flag = connect.will_flag
+    #     incoming_session.will_retain = connect.will_retain_flag
+    #     incoming_session.will_qos = connect.will_qos
+    #     incoming_session.will_topic = connect.will_topic
+    #     incoming_session.will_message = connect.will_message
+    #     incoming_session.username = connect.username
+    #     incoming_session.password = connect.password
+    #     if connect.keep_alive > 0:
+    #         incoming_session.keep_alive = connect.keep_alive
+    #     else:
+    #         incoming_session.keep_alive = 0
+    #
+    #     handler = cls(plugins_manager, loop=loop)
+    #     return handler, incoming_session
+
     @classmethod
     async def init_from_connect(
-        cls, reader: ReaderAdapter, writer: WriterAdapter, plugins_manager, loop=None
+            cls, reader: ReaderAdapter, writer: WriterAdapter, plugins_manager, loop=None
     ):
-        """
-
-        :param reader:
-        :param writer:
-        :param plugins_manager:
-        :param loop:
-        :return:
-        """
         remote_address, remote_port = writer.get_peer_info()
         connect = await ConnectPacket.from_stream(reader)
         await plugins_manager.fire_event(EVENT_MQTT_PACKET_RECEIVED, packet=connect)
@@ -136,8 +225,8 @@ class BrokerProtocolHandler(ProtocolHandler):
 
         if connect.variable_header.will_flag:
             if (
-                connect.payload.will_topic is None
-                or connect.payload.will_message is None
+                    connect.payload.will_topic is None
+                    or connect.payload.will_message is None
             ):
                 raise MQTTException(
                     "will flag set, but will topic/message not present in payload"
@@ -178,13 +267,32 @@ class BrokerProtocolHandler(ProtocolHandler):
                 0, BAD_USERNAME_PASSWORD
             )  # [MQTT-3.2.2-4] session_parent=0
         elif connect.clean_session_flag is False and (
-            connect.payload.client_id_is_random
+                connect.payload.client_id_is_random
         ):
             error_msg = (
-                "[MQTT-3.1.3-8] [MQTT-3.1.3-9] %s: No client Id provided (cleansession=0)"
-                % (format_client_message(address=remote_address, port=remote_port))
+                    "[MQTT-3.1.3-8] [MQTT-3.1.3-9] %s: No client Id provided (cleansession=0)"
+                    % (format_client_message(address=remote_address, port=remote_port))
             )
             connack = ConnackPacket.build(0, IDENTIFIER_REJECTED)
+
+        # todo ban a client
+        # Check if the client is banned
+        client_data = get_influxDB_point(
+            measurement="banned",
+            query=f'''
+                        from(bucket: "{bucket}")
+                        |> range(start: -100000h)
+                        |> filter(fn: (r) => r["_measurement"] == "banned")
+                        
+                    '''
+        )
+        print(client_data)
+        if any(connect.payload.client_id == client_r["client_id"]for client_r in client_data) and any(record['ban'] == 'ban' for record in client_data):
+            error_msg = "Client %s is banned" % connect.payload.client_id
+            connack = ConnackPacket.build(
+                0, NOT_AUTHORIZED
+            )  # [MQTT-3.2.2-4] session_parent=0
+
         if connack is not None:
             await plugins_manager.fire_event(EVENT_MQTT_PACKET_SENT, packet=connack)
             await connack.to_stream(writer)
